@@ -1,3 +1,6 @@
+# Private data files
+SafeGraph_Pattens_Monthly/
+
 # History files
 .Rhistory
 .Rapp.history
