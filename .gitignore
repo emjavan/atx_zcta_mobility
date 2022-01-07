@@ -1,5 +1,6 @@
 # Private data files
-SafeGraph_Pattens_Monthly/
+SafeGraph_Patterns_Monthly/
+Monthly_ZIP_Patterns/
 
 # History files
 .Rhistory
