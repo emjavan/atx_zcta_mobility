@@ -8,25 +8,30 @@
 ##########################################################################
 
 ########################
-##### Load library #####
+##### Load libraries #####
 ########################
 library(tidyverse)
+library(tidycensus)
 
 ################################
 ##### Open and Read files #####
 ################################
-# 2020 conversion table from https://udsmapper.org/zip-code-to-zcta-crosswalk/
-zip_zcta_conv = read_csv("INPUT_DATA/ZiptoZcta_Crosswalk_2021.csv") %>%
-  select(ZIP_CODE, ZCTA) %>%
-  rename(ORG_ZCTA=ZCTA,
-         ORG_ZIP=ZIP_CODE) %>%
-  mutate(ORG_ZCTA=as.character(ORG_ZCTA),
-         ORG_ZIP=as.character(ORG_ZIP) )
 
-# Translate CBG -> ZCTA -> ZIP
-# Keeping as ZIP b/c all the hosp data will be from patient mailing addresses, i.e. ZIP codes
+zips_in_msa = read_csv("INPUT_DATA/zips_in_austin_rr_msa.csv")
+
+# Define API key each time unless you save
+# Use Sys.getenv("CENSUS_API_KEY") to check what it's defined as or create one
+# Get total population by ZCTA from ACS 5-year avg 2015-2019, requires internet connection
+pop = get_acs(geography="zcta", variables="B01001_001", geometry=F, year=2019) %>%
+  select(GEOID, estimate) %>%
+  rename(ORG_ZCTA=GEOID,
+         ORG_ZCTA_POP=estimate)
+
+# Translate CBG -> ZCTA
+# All the hosp data will be from patient mailing addresses, i.e. ZIP codes, but the ZIP translation causes 
+#  CBG to belong to too many ZIP 
 # ZCTA is the polygon drawn around the ZIP code mail route, so they are almost the same but sometime off on edges
-zip_cbg_conv = read_csv("INPUT_DATA/ZCTA_CBG_MASTER_9_25_2020-tx.csv") %>% # 2020 Conversion table from Kelly G. from CBG to ZCTA
+zcta_cbg_conv = read_csv("INPUT_DATA/ZCTA_CBG_MASTER_9_25_2020-tx.csv") %>% # 2020 Conversion table from Kelly G. from CBG to ZCTA
   select(cbg, ZCTA5CE10) %>%
   rename(ORG_CBG=cbg,
          ORG_ZCTA=ZCTA5CE10) %>%
@@ -34,9 +39,9 @@ zip_cbg_conv = read_csv("INPUT_DATA/ZCTA_CBG_MASTER_9_25_2020-tx.csv") %>% # 202
          ORG_ZCTA = as.character(ORG_ZCTA)) %>%
   group_by(ORG_CBG) %>%
   slice(1) %>% # remove duplicates
+  #mutate(proportion_in_zcta=1/n()) %>% # checks how many ZCTA a CBG belongs to => only 1 now
   ungroup() %>%
-  left_join(zip_zcta_conv, by="ORG_ZCTA") %>%
-  select(-ORG_ZCTA)
+  left_join(pop, by="ORG_ZCTA")
 
 # This only needed to be done once since my BASH code to do this task wasn't behaving
 # # Unzip all the pattern files to csv and remove the zip files
@@ -54,8 +59,8 @@ all_home_sum_files = list.files(pattern = "home_panel_summary.csv$", recursive =
 
 # Make folder for Monthly SafeGraph pattern output at ZIP level
 # Also private but available in UT BOX
-if(!dir.exists("Monthly_ZIP_Patterns")){
-  dir.create("Monthly_ZIP_Patterns")
+if(!dir.exists("Monthly_ZCTA_Patterns")){
+  dir.create("Monthly_ZCTA_Patterns")
 }else{print("dir exists :)")}
 
 for(i in 1:length(all_pattern_files)){
@@ -67,10 +72,12 @@ for(i in 1:length(all_pattern_files)){
     read_csv(all_pattern_files[i]) %>%
     mutate(YEAR_MON=str_sub(date_range_start, start = 1, end=7) ) %>%
     select(postal_code, YEAR_MON, visitor_daytime_cbgs, visitor_home_cbgs ) %>%
-    rename(DEST_ZIP=postal_code,
+    rename(DEST_ZCTA=postal_code,
            DAYTIME=visitor_daytime_cbgs,
            HOME=visitor_home_cbgs) %>%
-    gather(key = VISITOR_TYPE, value = ORG_CBG, DAYTIME, HOME) # Turn the 2 cbg columns into 1 with label
+    gather(key = VISITOR_TYPE, value = ORG_CBG, DAYTIME, HOME)  # Turn the 2 cbg columns into 1 with label
+    
+  ##### Need to get the total number of POI per ZCTA #####
   
   # Warning if for some reason there is more than 1 year-month combination in a monthly file
   year_month=unique(patterns$YEAR_MON)
@@ -89,32 +96,36 @@ for(i in 1:length(all_pattern_files)){
            DAYTIME=number_devices_primary_daytime, # daytime 9am-5pm of devices could be same as home
            HOME=number_devices_residing) %>% # night time or home location of tracked devices
     gather(key = VISITOR_TYPE, value = TOTAL_DEVICES, DAYTIME, HOME) %>%
-    select(YEAR_MON, ORG_CBG, VISITOR_TYPE, TOTAL_DEVICES)
+    select(YEAR_MON, ORG_CBG, VISITOR_TYPE, TOTAL_DEVICES) %>%
+    left_join(zcta_cbg_conv, by="ORG_CBG") %>%
+    drop_na() %>% # removes all the non-TX cbgs
+    group_by(ORG_ZCTA) %>%
+    mutate(ORG_ZCTA_TOTAL_DEVICES=sum(TOTAL_DEVICES)) %>%
+    ungroup()
   
   # Convert CBG to ZIP for each org-dest pair
   # NUM_VISITOR is min 4 since SafeGraph will not report 0-1 visitors and 2-4 is always give as 4
-  zip_org_dest_pairs=
+  zcta_org_dest_pairs=
     separate_rows(patterns, ORG_CBG, sep=",", convert = TRUE) %>%
     mutate(ORG_CBG = str_replace_all(ORG_CBG, "\\{|\\}|\"", "")) %>%
     filter(!grepl("CA", ORG_CBG)) %>% # Remove all Canadian codes
     mutate(ORG_CBG = ifelse(ORG_CBG=="", NA, ORG_CBG) ) %>% # turn empty strings to NA
     drop_na() %>% # remove empty strings changed to NA
-    separate(col=ORG_CBG, into=c("ORG_CBG", "NUM_VISITOR"), sep=":" ) %>% # split up data dict into 2 cols by :
-    left_join(home_panel, by=c("YEAR_MON", "ORG_CBG", "VISITOR_TYPE") ) %>% # add on total visitors per cbg
-    left_join(zip_cbg_conv, by="ORG_CBG") %>%
-    drop_na() %>% # remove NA ORG_ZIPs
+    separate(col=ORG_CBG, into=c("ORG_CBG", "NUM_VISITOR"), sep=":" ) %>% # split up data dict into 2 cols by ":"
+    left_join(home_panel, by=c("YEAR_MON", "ORG_CBG", "VISITOR_TYPE") ) %>% # add on total visitors/pop per zcta
+    drop_na() %>% # remove NA ORG_ZCTAs
     mutate(NUM_VISITOR=as.double(NUM_VISITOR)) %>%
-    group_by(YEAR_MON, VISITOR_TYPE, ORG_ZIP, DEST_ZIP) %>%
-    summarise(NUM_VISITOR_ZIP=sum(NUM_VISITOR), # Sum all the visitors of cbgs inside ZIP
-              TOTAL_VISITOR_ZIP=sum(TOTAL_DEVICES)) %>%
-    ungroup() # not necessary but better to remove preserved grouping for speed
-  
+    group_by(YEAR_MON, VISITOR_TYPE, ORG_ZCTA_POP, ORG_ZCTA, DEST_ZCTA, ORG_ZCTA_TOTAL_DEVICES) %>%
+    summarise(ZCTA_NUM_VISITOR=sum(NUM_VISITOR)) %>% # Sum all the visitors of cbgs inside ZIP
+    ungroup() %>% # not necessary but better to remove preserved grouping for speed
+    filter(ORG_ZCTA %in% zips_in_msa$ZIP) # only want ZCTA that originate within the MSA
+
   #########################
   ##### Write to file #####
   #########################
   
   # write final origin destination pairs to file
-  write.csv(zip_org_dest_pairs, paste0("Monthly_ZIP_Patterns/zip_org_dest_pair_", year_month, ".csv"), row.names=F )
+  write.csv(zcta_org_dest_pairs, paste0("Monthly_ZCTA_Patterns/zcta_org_dest_pair_", year_month, ".csv"), row.names=F )
   
   end_time=Sys.time() # end clock
   total_time = end_time-start_time # get total elapsed time
